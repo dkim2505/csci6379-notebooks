@@ -8,7 +8,7 @@ submittable submission.zip that scores ~90%.
 """
 import json
 
-DATA_BASE = "https://raw.githubusercontent.com/dkim2505/csci6379-data/main"  # released Sep 12
+DATA_BASE = "https://dlarena976f6f2c01.blob.core.windows.net/public"
 
 def md(*lines):
     return {"cell_type": "markdown", "metadata": {}, "source": _lines(lines)}
