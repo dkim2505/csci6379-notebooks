@@ -8,7 +8,9 @@ local FID estimate and the submission checker all use the same code.
 
 The fixed loop is the recipe of our reference runs ("level 2"): T = 1000, betas
 linspace(1e-4, 0.02), Adam lr 2e-4, batch 128, MSE on eps, EMA 0.999, horizontal
-flips, 1000 warmup steps, grad clip 1.0, fp32. sample() is the grader's sampler,
+flips, 1000 warmup steps, grad clip 1.0, fp32. Training runs for EPOCHS epochs (one epoch =
+one reshuffled pass over the training images, 70 steps of 128); the length is an ordinary
+hyperparameter (default 200), not a wall-clock budget (user, 2026-10-22). sample() is the grader's sampler,
 unchanged (strided DDPM, 250 steps). The starter network is the reference runs'
 CourseUNet(64), renamed Denoiser (identical parameters and state_dict keys).
 
@@ -127,7 +129,7 @@ DIFFUSION = r'''
 #
 # The noise schedule, the training loop (data, loss, optimizer, warmup, clipping, EMA)
 # and the sampler. Everyone trains with exactly this code, so differences in scores come
-# from the network and how long it trained. Editing this file does not change your score:
+# from the network and how many epochs it trained. Editing this file does not change your score:
 # the grader samples your network with its own copy of sample() below.
 import copy, os, time
 
@@ -186,7 +188,7 @@ def grid(imgs, cols=8):
     return g
 
 
-def _show_progress(history, ema, log, nhead):
+def _show_progress(history, ema, log, nhead, spe):
     # The progress display: the last log lines, the loss curve and a quick PREVIEW grid.
     import matplotlib.pyplot as plt
     try:
@@ -200,10 +202,11 @@ def _show_progress(history, ema, log, nhead):
     fig, ax = plt.subplots(1, 2, figsize=(13, 4.6), gridspec_kw={"width_ratios": [1.35, 1]})
     s = np.array([h[0] for h in history]); l = np.array([h[1] for h in history])
     k = max(1, len(l) // 50)                             # smooth the curve over about 2% of the run
-    ax[0].plot(s, l, color="0.75", lw=0.8, label="loss (mean of 50 steps)")
+    s = s / spe                                         # steps -> epochs
+    ax[0].plot(s, l, color="0.75", lw=0.8, label="loss")
     if len(l) >= k:
         ax[0].plot(s[k - 1:], np.convolve(l, np.ones(k) / k, "valid"), color="C0", lw=1.6, label="smoothed")
-    ax[0].set_xlabel("training step"); ax[0].set_ylabel("MSE on the noise"); ax[0].grid(alpha=0.3)
+    ax[0].set_xlabel("epoch"); ax[0].set_ylabel("MSE on the noise"); ax[0].grid(alpha=0.3)
     if len(l):
         ax[0].set_ylim(0.9 * l[len(l) // 10:].min(), 1.1 * np.percentile(l[len(l) // 10:], 99))
     ax[0].legend(); ax[0].set_title("training loss")
@@ -213,9 +216,11 @@ def _show_progress(history, ema, log, nhead):
     plt.tight_layout(); plt.show()
 
 
-def train(make_net, images, ckpt_path, minutes, ckpt_minutes=10.0, model_src=None):
-    # Train for `minutes` of wall-clock time in this session, saving a checkpoint every
-    # `ckpt_minutes`. If ckpt_path exists, continue from it. Returns the EMA network.
+def train(make_net, images, ckpt_path, epochs, ckpt_every=10, model_src=None):
+    # Train until `epochs` epochs in total (one epoch = one pass over the training images,
+    # reshuffled every epoch), saving a checkpoint and showing progress every `ckpt_every`
+    # epochs. If ckpt_path exists, continue from it, so after a disconnect the same cell picks
+    # up where it stopped. Returns the EMA network.
     data = torch.from_numpy(images).to(dev).permute(0, 3, 1, 2).contiguous()   # uint8 on the GPU
     n = len(data)
     torch.manual_seed(SEED); np.random.seed(SEED)
@@ -225,7 +230,9 @@ def train(make_net, images, ckpt_path, minutes, ckpt_minutes=10.0, model_src=Non
     nparam = n_params(net)
     assert nparam <= PARAM_LIMIT, f"{nparam:,} parameters is over the {PARAM_LIMIT:,} limit"
     step, elapsed, history = 0, 0.0, []
-    log = [f"{nparam:,} parameters, {n:,} training images, checkpoint {ckpt_path}"]
+    spe = n // BATCH                                     # steps per epoch (the last partial batch is dropped)
+    target = epochs * spe
+    log = [f"{nparam:,} parameters, {n:,} training images, {spe} steps of {BATCH} per epoch, checkpoint {ckpt_path}"]
     if os.path.exists(ckpt_path):
         s = torch.load(ckpt_path, map_location=dev, weights_only=False)   # your own file
         try:
@@ -237,15 +244,14 @@ def train(make_net, images, ckpt_path, minutes, ckpt_minutes=10.0, model_src=Non
         torch.set_rng_state(s["rng"].cpu())
         if s["cuda_rng"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state(s["cuda_rng"].cpu())
-        log.append(f"resumed from the checkpoint: step {step:,}, {elapsed / 60:.1f} min of training so far")
+        log.append(f"resumed from the checkpoint: epoch {step / spe:,.1f} (step {step:,})")
         if model_src is not None and s.get("model_src") not in (None, model_src):
             log.append("WARNING: model.py has changed since this checkpoint was saved, but the weights still fit.\n"
                        "         If you changed the network, set a new RUN_NAME so the runs do not mix.")
     else:
         log.append("no checkpoint yet: starting a new run")
 
-    def batch():
-        idx = torch.randint(0, n, (BATCH,), device=dev)
+    def batch(idx):
         x = data[idx].float() / 127.5 - 1                # uint8 0..255 -> float -1..1
         m = torch.rand(len(x), device=dev) < 0.5; x[m] = x[m].flip(-1)     # random horizontal flips
         return x
@@ -260,16 +266,20 @@ def train(make_net, images, ckpt_path, minutes, ckpt_minutes=10.0, model_src=Non
 
     print("\n".join(log), flush=True)
     nhead = len(log)
-    start = time.time(); last_ckpt = last_log = start; step0, elapsed0 = step, elapsed
+    if step >= target:
+        log.append(f"already trained {step / spe:,.0f} epochs (EPOCHS = {epochs:,}): raise EPOCHS to train longer")
     net.train()
     try:
-        while time.time() - start < minutes * 60:
+        while step < target:
+            ep, pos = divmod(step, spe)                  # pos > 0 only when resuming mid-epoch
+            perm = torch.randperm(n, generator=torch.Generator().manual_seed(SEED * 100_003 + ep)).to(dev)
             if dev == "cuda": torch.cuda.synchronize()
             t0 = time.perf_counter(); loss_sum = torch.zeros((), device=dev)
-            for _ in range(50):
+            for b in range(pos, spe):
                 lr = LR * min(1.0, (step + 1) / WARMUP)
                 for g in opt.param_groups: g["lr"] = lr
-                x0 = batch(); t = torch.randint(0, T, (len(x0),), device=dev); eps = torch.randn_like(x0)
+                x0 = batch(perm[b * BATCH:(b + 1) * BATCH])
+                t = torch.randint(0, T, (len(x0),), device=dev); eps = torch.randn_like(x0)
                 ab = abar[t][:, None, None, None]; xt = ab.sqrt() * x0 + (1 - ab).sqrt() * eps   # noisy images
                 out = net(xt, t)                                    # the network guesses the noise
                 loss = F.mse_loss(out.float(), eps)
@@ -278,30 +288,26 @@ def train(make_net, images, ckpt_path, minutes, ckpt_minutes=10.0, model_src=Non
                 opt.step(); step += 1
                 with torch.no_grad():
                     for pe, p in zip(ema.parameters(), net.parameters()): pe.lerp_(p, 1 - EMA_DECAY)
-                    for be, b in zip(ema.buffers(), net.buffers()): be.copy_(b)   # e.g. BatchNorm statistics
+                    for be, bb in zip(ema.buffers(), net.buffers()): be.copy_(bb)   # e.g. BatchNorm statistics
                 loss_sum += loss.detach()
             if dev == "cuda": torch.cuda.synchronize()
-            elapsed += time.perf_counter() - t0
-            history.append((step, (loss_sum / 50).item()))
-            now = time.time()
-            if now - last_log >= 60:
-                rate = (step - step0) / max(1e-9, (elapsed - elapsed0) / 60)
-                log.append(f"step {step:>8,}  loss {np.mean([h[1] for h in history[-20:]]):.4f}  "
-                           f"{rate:,.0f} steps/min  trained {elapsed / 60:6.1f} min in total  "
-                           f"(this session {(now - start) / 60:.1f} of {minutes:g} min)")
-                print(log[-1], flush=True); last_log = now
-            if now - last_ckpt >= ckpt_minutes * 60:
-                save(); last_ckpt = time.time()
-                log.append(f"           checkpoint saved at step {step:,}")
-                _show_progress(history, ema, log, nhead)
+            sec = time.perf_counter() - t0; elapsed += sec
+            history.append((step, (loss_sum / (spe - pos)).item()))
+            done = step // spe
+            log.append(f"epoch {done:>6,} / {epochs:,}  loss {history[-1][1]:.4f}  ({sec:.1f} s for this epoch)")
+            print(log[-1], flush=True)
+            if done % ckpt_every == 0 and step < target:
+                save()
+                log.append(f"           checkpoint saved at epoch {done:,}")
+                _show_progress(history, ema, log, nhead, spe)
     except KeyboardInterrupt:
         log.append("stopped by you (interrupt): saving a checkpoint")
     save()
     del data, opt
     if dev == "cuda": torch.cuda.empty_cache()           # give back GPU memory the next cells need
-    log.append(f"checkpoint saved at step {step:,}, {elapsed / 60:.1f} min of training in total")
+    log.append(f"checkpoint saved at epoch {step / spe:,.1f} (step {step:,})")
     if history:
-        _show_progress(history, ema, log, nhead)
+        _show_progress(history, ema, log, nhead, spe)
     else:
         print("\n".join(log))
     return ema
@@ -494,12 +500,12 @@ md("""
 
 Colab disconnects: after a while idle, when the browser tab sleeps, or when you reach a
 usage limit. Everything in the session is lost then, including a half-trained model.
-Diffusion models need **many hours** of training, so you will be disconnected, probably
-more than once.
+Diffusion models need many epochs of training, which takes hours on a free GPU, so you will be
+disconnected, probably more than once.
 
 With Drive connected, the notebook keeps two things in a Drive folder, `csci6379_hw3`:
 
-- a **checkpoint** of your training, saved every few minutes, and
+- a **checkpoint** of your training, saved every few epochs, and
 - a copy of your **training images**, so you do not need to download them again.
 
 After a disconnect: reconnect, run all the cells again, and training continues from the
@@ -667,14 +673,14 @@ for i in range(13):
     opt.zero_grad(); loss.backward(); opt.step()
 if dev == "cuda": torch.cuda.synchronize()
 ms = (time.time() - t0) / 10 * 1000
-print(f"one training step (batch 128): about {ms:.0f} ms, so about {60000 / ms:,.0f} steps per minute here")
+spe = len(TRAIN) // 128
+print(f"one training step (batch 128): about {ms:.0f} ms, so one epoch ({spe} steps) takes about {spe * ms / 1000:.0f} s here")
 del net, opt, x, y, loss
 """)
 
 md("""
 **Check:** `parameters: 3,320,387`, `output shape: (128, 3, 64, 64)`, and a step time. A bigger
-network takes longer per step, so in the same hours it gets fewer steps. That trade is part
-of your design.
+network takes longer per step, so every epoch takes longer with it.
 """)
 
 md("""
@@ -685,7 +691,7 @@ The rest of the assignment, the same for everyone:
 | part | setting |
 |---|---|
 | noise schedule | $T = 1000$ steps, $\\beta_t$ linear from $10^{-4}$ to $0.02$ |
-| training batch | 128 random training images, each flipped left-right with probability 1/2 |
+| training batch | 128 training images per step, reshuffled every epoch, each flipped left-right with probability 1/2 |
 | loss | mean squared error between the true noise $\\epsilon$ and your network's guess |
 | optimizer | Adam, learning rate $2 \\times 10^{-4}$, warmed up over the first 1,000 steps, gradient norm clipped at 1.0 |
 | EMA | a slowly moving average of the weights (decay 0.999); these are the weights you submit |
@@ -704,24 +710,27 @@ Settings you may change:
 
 - `RUN_NAME`: the name of this run's checkpoint. **Change it whenever you change
   `model.py`**, so a new network starts fresh instead of picking up the old one's checkpoint.
-- `TRAIN_MINUTES`: how long this cell trains **this time**. Then it saves and stops; run it
-  again to train more. To train until Colab stops you, set it large (600). Set it to 0 to
-  only load your latest checkpoint (for example, to submit after a disconnect).
-- `CKPT_MINUTES`: how often it saves a checkpoint and shows progress.
+- `EPOCHS`: how many epochs to train in total. One epoch is one pass over your 9,000 training
+  images (70 steps of 128). As with any network, training longer usually gives better
+  pictures; the default is a reasonable start. When the run reaches `EPOCHS` it saves and
+  stops. To train longer, raise `EPOCHS` and run the cell again: it continues from the
+  checkpoint. If the checkpoint already has `EPOCHS` epochs, the cell only loads it (for
+  example, to submit after a disconnect).
+- `CKPT_EVERY`: every how many epochs it saves a checkpoint and shows progress.
 
-Every `CKPT_MINUTES` it shows the loss curve and a **preview**: 16 pictures from the EMA
+Every `CKPT_EVERY` epochs it shows the loss curve and a **preview**: 16 pictures from the EMA
 weights with only **50** sampling steps, to be quick. They look rougher than what the grader
 sees with 250 steps. Early on they are colored blobs; give it time.
 
 **Resuming.** Run all the cells from the top again. This cell finds the checkpoint
-`RUN_NAME.pt` in your Drive folder and continues from it: same step, same optimizer, same
-EMA. Pressing the stop button also saves a checkpoint before it stops.
+`RUN_NAME.pt` in your Drive folder and continues from it, up to `EPOCHS`: same step, same
+optimizer, same EMA. Pressing the stop button also saves a checkpoint before it stops.
 """)
 
 code("""
 RUN_NAME = "starter"     # change this whenever you change model.py
-TRAIN_MINUTES = 60       # how long to train this time; run the cell again to continue
-CKPT_MINUTES = 10        # how often to save a checkpoint and show the preview
+EPOCHS = 200             # how many epochs to train in total; raise it and run again to train longer
+CKPT_EVERY = 10          # every how many epochs to save a checkpoint and show the preview
 
 # ---- DO NOT EDIT below this line
 import importlib, diffusion, model
@@ -730,16 +739,16 @@ from diffusion import sample, grid
 from model import Denoiser
 
 CKPT = os.path.join(WORK_DIR, RUN_NAME + ".pt")
-ema = diffusion.train(Denoiser, TRAIN, CKPT, TRAIN_MINUTES, CKPT_MINUTES,
+ema = diffusion.train(Denoiser, TRAIN, CKPT, EPOCHS, CKPT_EVERY,
                       model_src=open("model.py").read())
 """)
 
 md("""
-**Check:** a log line every minute with the loss, the steps per minute and the total training
-time, and the preview every `CKPT_MINUTES`. The loss drops fast in the first few thousand steps
-and then very slowly; the pictures keep improving long after the loss seems flat. For scale,
-the assignment page has our FID after 1, 3 and 6 hours on an A100, and a free Colab GPU is
-several times slower.
+**Check:** a log line every epoch with the loss and the seconds that epoch took, and the
+preview every `CKPT_EVERY` epochs. The loss drops fast in the first few dozen epochs and then
+very slowly; the pictures keep improving long after the loss seems flat, so training longer
+usually helps. For scale, the assignment page lists our own FIDs for two networks after
+several numbers of epochs.
 """)
 
 md("""
